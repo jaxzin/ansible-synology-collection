@@ -1,1 +1,5 @@
 .vscode/
+# Local Ansible collection cache created when running the tests/ playbooks
+.ansible/
+*.tar.gz
+*.retry

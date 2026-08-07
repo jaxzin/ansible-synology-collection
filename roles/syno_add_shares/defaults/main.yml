@@ -1,11 +1,44 @@
+---
+# ---------------------------------------------------------------------------
+# syno_add_shares — desired-state shared-folder management via the DSM HTTP API.
+#
+# The CLI approach (`/usr/syno/sbin/synoshare --add`) FAILS on DSM 7.2 with
+# `share_is_acl_share.c:49`; this role drives the DSM Web API instead, through
+# the tafeen.synology.dsm_session funnel. Read -> diff -> apply, idempotent by
+# construction (mutations are gated on `converge=true` AND a real diff).
+# ---------------------------------------------------------------------------
+
+# REQUIRED: the list of shares to manage. See README.md and meta/argument_specs.yml
+# for the full schema. Each item: name, description, volume (or path), rights
+# {RW/RO}, recycle, enable_time_machine, quota_gb.
 syno_shares: "{{ undef(hint='You must specify syno_shares') }}"
+
+# Retained for backward-compatibility with the original role (unused by the HTTP
+# API path; kept so existing inventories that set it do not error).
 syno_upgrade_packages: false
-  # - name: media
-  #   description: MEDIA Share
-  #   path: /volume2/media
-  #   rights:
-  #     RW:
-  #       - daniel
-  #     RO:
-  #       - maciek
-  #  recycle: true
+
+# --- Converge safety gate ----------------------------------------------------
+# Validate-only by DEFAULT: run 1 reads current state, prints a diff, and makes
+# NO changes. Pass -e converge=true to actually create/modify. Every mutating
+# task is gated on `converge | bool` AND a real diff, so a second converge run
+# finds nothing to do and reports changed=0.
+converge: false
+
+# --- DSM API versions (entry.cgi). Bump only if a future DSM requires it; the
+# SURFACE debug tasks print live responses so a wrong version/field is visible.
+dsm_api_ver_share: "1"        # SYNO.Core.Share (create/list)
+dsm_api_ver_share_perm: "1"   # SYNO.Core.Share.Permission (list/set)
+dsm_api_ver_smb: "3"          # SYNO.Core.FileServ.SMB (get/set) — Time Machine folders
+
+# --- Time Machine designation (SMB service) ----------------------------------
+# On DSM 7.2, marking a shared folder as a Time Machine target is NOT a
+# SYNO.Core.Share property and does not appear in Share.list — it is a GLOBAL
+# SYNO.Core.FileServ.SMB setting holding the LIST of designated folder names
+# (Control Panel > File Services > SMB > Advanced > "Set Time Machine Folders").
+#
+# The exact SMB field name that carries that list could not be confirmed against
+# a live NAS while building this role (no credentials were reachable). It is
+# isolated in this ONE variable so the first live run — whose SURFACE task prints
+# the full SMB `get` response — makes the real name obvious, and correcting it is
+# a one-line change here. `tm_folder` is the best-effort default.
+syno_smb_tm_folder_field: "tm_folder"

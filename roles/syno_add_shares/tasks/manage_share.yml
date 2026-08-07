@@ -1,0 +1,207 @@
+---
+# Converge ONE declared share (loop_var: share). Read -> diff -> apply -> verify.
+#
+# SAFETY CONTRACT (converge-playbook skill):
+#   RULE 1 — CREATE absent shares; VERIFY existing ones. If an existing share
+#            differs on an IMMUTABLE property (volume), FAIL with a diff — never
+#            delete/recreate/move from the converge path.
+#   RULE 2 — Touch ONLY this declared share (and its own rights / TM flag); never
+#            edit a neighbouring share.
+#   Mutations are gated on `converge | bool` AND a real diff; a second converge
+#   run finds nothing to do and reports changed=0.
+
+# --- Normalise the desired state for this share ------------------------------
+- name: "[{{ share.name }}] Resolve desired share properties"
+  ansible.builtin.set_fact:
+    _share_name: "{{ share.name }}"
+    _share_desc: "{{ share.description | default('') }}"
+    # DSM Share.create wants the VOLUME root (e.g. /volume1) as vol_path; the
+    # folder is created at <vol_path>/<name>. Accept an explicit `volume`, or
+    # derive it from the first path segment of the legacy `path` key
+    # (/volume3/media -> /volume3) so existing inventories keep working.
+    _share_volume: "{{ share.volume | default('/' ~ (share.path | default('') | regex_replace('^/+', '') | split('/') | first)) }}"
+    _share_recycle: "{{ share.recycle | default(false) | bool }}"
+    _share_tm: "{{ share.enable_time_machine | default(false) | bool }}"
+    _share_has_quota: "{{ share.quota_gb is defined }}"
+    _share_rw: "{{ (share.rights | default({})).RW | default([]) }}"
+    _share_ro: "{{ (share.rights | default({})).RO | default([]) }}"
+
+# share_quota is the DSM Share.create quota field (integer). UNITS UNCONFIRMED
+# against a live NAS at build time: this role assumes the field is in GIBIBYTES
+# and sends quota_gb through unchanged. If the first converge shows the wrong
+# effective quota in the DSM UI (Control Panel > Shared Folder > Edit > Advanced),
+# the field is likely in MB — change ONLY this one expression to
+# `{{ (share.quota_gb | default(0) | int) * 1024 }}`. The SURFACE task below
+# prints the stored value so units can be reconciled on run 1.
+- name: "[{{ share.name }}] Compute the quota value to send (assumed unit: GB)"
+  ansible.builtin.set_fact:
+    _share_quota_api: "{{ (share.quota_gb | default(0) | int) }}"
+
+- name: "[{{ share.name }}] Guard — share description fits DSM's 64-char limit"
+  ansible.builtin.assert:
+    that:
+      - (_share_desc | length) <= 64
+    fail_msg: >-
+      description for share '{{ _share_name }}' is {{ _share_desc | length }}
+      characters; DSM rejects a shared-folder description longer than 64 at
+      create time (bare error 3300). Shorten it in syno_shares.
+    quiet: true
+
+- name: "[{{ share.name }}] Guard — a volume could be resolved"
+  ansible.builtin.assert:
+    that:
+      - _share_volume | length > 1
+    fail_msg: >-
+      Could not resolve a volume for share '{{ _share_name }}'. Set `volume`
+      (e.g. /volume1) or a full `path` (e.g. /volume1/media) in syno_shares.
+    quiet: true
+
+# --- Existence (RULE 1: create-if-absent, never recreate) --------------------
+- name: "[{{ share.name }}] List shared folders"
+  ansible.builtin.include_tasks: "{{ dsm_api_call }}"
+  vars:
+    dsm_call_name: "list shared folders"
+    dsm_call_body:
+      api: SYNO.Core.Share
+      version: "{{ dsm_api_ver_share }}"
+      method: list
+      # Request the extra property groups we diff/verify on (JSON array string,
+      # matching the DSM web UI + synology-api). SURFACE below confirms the shape.
+      additional: '["share_quota","recyclebin","enable_share_cow","enable_share_compress","hidden","encryption"]'
+
+- name: "[{{ share.name }}] Record share inventory"
+  ansible.builtin.set_fact:
+    _share_all: "{{ dsm_call_result.json.data.shares | default([]) }}"
+
+- name: "[{{ share.name }}] Locate this share (if any)"
+  ansible.builtin.set_fact:
+    _share_record: "{{ (_share_all | selectattr('name', 'equalto', _share_name) | list | first) | default({}, true) }}"
+    _share_present: "{{ (_share_all | selectattr('name', 'equalto', _share_name) | list | length) > 0 }}"
+
+# SURFACE — print the live Share.list response ONCE (run 1) so field names are
+# confirmed, not guessed. Bodies are secret-free (the sid lives only in the
+# request Cookie header). Also print this share's located record for a per-share
+# view of the fields we diff on.
+- name: "SURFACE — full SYNO.Core.Share list response (field-name confirmation)"
+  ansible.builtin.debug:
+    var: _share_all
+  when: share_index | int == 0
+
+- name: "[{{ share.name }}] SURFACE — located share record"
+  ansible.builtin.debug:
+    var: _share_record
+
+- name: "[{{ share.name }}] RULE 1 — refuse to move/recreate a share on the wrong volume"
+  ansible.builtin.assert:
+    that:
+      - >-
+        not _share_present
+        or (_share_record.vol_path | default(_share_volume)) == _share_volume
+    fail_msg: >-
+      Share '{{ _share_name }}' already exists on volume
+      '{{ _share_record.vol_path | default("unknown") }}' but the desired volume
+      is '{{ _share_volume }}'. RULE 1: never move or recreate an existing share.
+      Reconcile by hand or change the desired volume.
+    quiet: true
+
+# --- Create (only when absent AND converge) ----------------------------------
+- name: "[{{ share.name }}] Build the create payload (shareinfo)"
+  ansible.builtin.set_fact:
+    # shareinfo MUST be COMPACT single-line JSON. The sid + SynoToken ride as
+    # HEADERS from api_call.yml, never in this body. Field set mirrors DSM 7.2's
+    # own web-UI create request (see roles/nfs_share in homelab-netboot for the
+    # create-3300 provenance): desc <= 64 chars; recycle_bin_admin_only true is
+    # the value proven to create cleanly. share_quota is added only when declared.
+    _shareinfo_json: >-
+      {{ ({'name': _share_name, 'vol_path': _share_volume, 'desc': _share_desc,
+      'enable_recycle_bin': _share_recycle, 'recycle_bin_admin_only': true,
+      'enable_share_cow': false, 'enable_share_compress': false, 'name_org': ''}
+      | combine({'share_quota': (_share_quota_api | int)} if _share_has_quota else {}))
+      | to_json(separators=[',', ':']) }}
+
+- name: "[{{ share.name }}] WOULD CREATE (validate-only; pass -e converge=true to apply)"
+  ansible.builtin.debug:
+    msg: >-
+      Share '{{ _share_name }}' is ABSENT on volume '{{ _share_volume }}'. Would
+      create with shareinfo={{ _shareinfo_json }}.
+  when:
+    - not _share_present
+    - not (converge | bool)
+
+- name: "[{{ share.name }}] Create the shared folder (absent + converge)"
+  ansible.builtin.include_tasks: "{{ dsm_api_call }}"
+  vars:
+    dsm_call_name: "create shared folder {{ _share_name }}"
+    dsm_call_changed: true
+    dsm_call_body:
+      api: SYNO.Core.Share
+      version: "{{ dsm_api_ver_share }}"
+      method: create
+      # Top-level name JSON-quoted (matches the DSM UI + synology-csi strconv.Quote).
+      name: "{{ _share_name | to_json }}"
+      shareinfo: "{{ _shareinfo_json }}"
+  when:
+    - not _share_present
+    - converge | bool
+
+# --- Rights (SYNO.Core.Share.Permission) and Time Machine (SMB) ---------------
+# Only meaningful once the share exists (present-before, or just created under
+# converge). In validate-only + absent, there is nothing yet to permission.
+- name: "[{{ share.name }}] Converge share rights (RW/RO)"
+  ansible.builtin.include_tasks: rights.yml
+  when: _share_present or (converge | bool)
+
+- name: "[{{ share.name }}] Converge Time Machine designation"
+  ansible.builtin.include_tasks: time_machine.yml
+  when: _share_present or (converge | bool)
+
+# --- Read-back verify: assert the managed tuple (RULE 1 for existing shares) --
+# Skip only when the share is absent AND we did not converge (nothing to verify).
+- name: "[{{ share.name }}] Verify block"
+  when: _share_present or (converge | bool)
+  block:
+    - name: "[{{ share.name }}] Re-list shared folders to confirm state"
+      ansible.builtin.include_tasks: "{{ dsm_api_call }}"
+      vars:
+        dsm_call_name: "verify shared folder {{ _share_name }}"
+        dsm_call_body:
+          api: SYNO.Core.Share
+          version: "{{ dsm_api_ver_share }}"
+          method: list
+          additional: '["share_quota","recyclebin","enable_share_cow","enable_share_compress","hidden","encryption"]'
+
+    - name: "[{{ share.name }}] Record verified share record"
+      ansible.builtin.set_fact:
+        _share_verify: "{{ (dsm_call_result.json.data.shares | default([]) | selectattr('name', 'equalto', _share_name) | list | first) | default({}, true) }}"
+
+    - name: "[{{ share.name }}] SURFACE — effective share record (reconcile quota units here)"
+      ansible.builtin.debug:
+        msg: >-
+          Effective record for '{{ _share_name }}':
+          vol_path={{ _share_verify.vol_path | default('?') }},
+          share_quota={{ _share_verify.share_quota | default('n/a') }}
+          (compare against the DSM UI's human-readable quota to confirm units).
+
+    - name: "[{{ share.name }}] Verify the share exists on the desired volume"
+      ansible.builtin.assert:
+        that:
+          - _share_verify | length > 0
+          - (_share_verify.vol_path | default('')) == _share_volume
+        fail_msg: >-
+          Share '{{ _share_name }}' did not converge: expected it present on
+          volume '{{ _share_volume }}', got
+          vol_path='{{ _share_verify.vol_path | default("ABSENT") }}'.
+        quiet: true
+
+    - name: "[{{ share.name }}] Verify the quota applied (when declared)"
+      ansible.builtin.assert:
+        that:
+          - (_share_verify.share_quota | default(-1) | int) == (_share_quota_api | int)
+        fail_msg: >-
+          Quota for '{{ _share_name }}' did not apply: sent share_quota=
+          {{ _share_quota_api }}, DSM stored
+          {{ _share_verify.share_quota | default('n/a') }}. (This asserts the
+          value round-tripped; confirm the UNIT separately in the DSM UI — see
+          the SURFACE line above.)
+        quiet: true
+      when: _share_has_quota | bool

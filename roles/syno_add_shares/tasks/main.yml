@@ -1,27 +1,60 @@
-- name: Get list of Shares
-  become: true
-  ansible.builtin.command: "/usr/syno/sbin/synoshare synoshare --enum all"
-  when: true
-  changed_when: false
-  register: synoshares_list
+---
+# syno_add_shares entry point. Drives the DSM HTTP API (entry.cgi) from the
+# control node to converge each declared shared folder. See defaults/main.yml
+# and README.md for the schema and the converge safety contract.
+#
+# Execution model note: unlike the original CLI role (which ran ON the NAS via
+# `become: true`), this runs against the DSM Web API over HTTPS. Target it at
+# localhost with connection: local (see the example playbook under tests/).
 
-- name: Create share if not present
-  when: share.name not in synoshares_list.stdout_lines
-  ansible.builtin.include_tasks: tasks/create_share.yml
-  loop: "{{ syno_shares }}"
-  loop_control:
-    loop_var: share
+- name: Require DSM credentials in the environment
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'DSM_ACCOUNT') | length > 0
+      - lookup('ansible.builtin.env', 'DSM_PASSWORD') | length > 0
+    fail_msg: >-
+      DSM_ACCOUNT and DSM_PASSWORD must be exported in the environment before
+      running syno_add_shares (an administrators-group DSM account). Optional:
+      DSM_OTP_CODE for a 2FA-enabled account.
+    quiet: true
+  no_log: true
 
-- name: Ensure share rights
-  ansible.builtin.include_tasks: tasks/add_rights.yml
-  loop: "{{ syno_shares }}"
-  loop_control:
-    loop_var: share
+- name: Announce mode (validate-only unless converge=true)
+  ansible.builtin.debug:
+    msg: >-
+      syno_add_shares running in
+      {{ 'CONVERGE (mutations enabled)' if (converge | bool) else 'VALIDATE-ONLY (no changes; pass -e converge=true to apply)' }}
+      mode for {{ syno_shares | length }} declared share(s).
 
-- name: Set recycle bin
-  when: share.recycle is defined and share.recycle
-  ansible.builtin.command:
-    /usr/syno/bin/synorecycle --enable {{ share.name }}
-  loop: "{{ syno_shares }}"
-  loop_control:
-    loop_var: share
+- name: Converge shares, always releasing the DSM session at the end
+  block:
+    # Short name resolves to the same-collection dsm_session role when installed
+    # as tafeen.synology, and via roles_path when run from a bare repo checkout
+    # (see tests/ansible.cfg) — so both usages work without edits.
+    - name: Log in to DSM (obtain a session id)
+      ansible.builtin.include_role:
+        name: dsm_session
+        tasks_from: login
+
+    # The api_call funnel is a task file in the sibling dsm_session role. Resolve
+    # its absolute path once (role_path is this role) so per-call include_tasks
+    # stay lightweight — the funnel keeps the sid in a Cookie header + no_log's
+    # every call (RULE 3). dsm_session's defaults were loaded by the login
+    # include above, so dsm_entry_cgi / dsm_no_log / etc. are in scope here.
+    - name: Resolve the DSM API-call funnel path
+      ansible.builtin.set_fact:
+        dsm_api_call: "{{ role_path }}/../dsm_session/tasks/api_call.yml"
+
+    - name: Manage each declared share
+      ansible.builtin.include_tasks: manage_share.yml
+      loop: "{{ syno_shares }}"
+      loop_control:
+        loop_var: share
+        index_var: share_index
+        label: "{{ share.name }}"
+  always:
+    - name: Log out of DSM (release the session)
+      ansible.builtin.include_role:
+        name: dsm_session
+        tasks_from: logout
+      when: dsm_sid is defined

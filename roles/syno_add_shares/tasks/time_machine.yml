@@ -1,0 +1,115 @@
+---
+# Converge the Time Machine designation for one share.
+#
+# On DSM 7.2 this is NOT a SYNO.Core.Share property — it is a GLOBAL
+# SYNO.Core.FileServ.SMB setting holding the LIST of shared-folder names that are
+# Time Machine targets (Control Panel > File Services > SMB > Advanced > "Set
+# Time Machine Folders"). We therefore read the SMB config, add/remove ONLY this
+# declared share's name from that list (RULE 2 — every other folder in the list
+# is preserved), and write it back.
+#
+# UNCONFIRMED AGAINST A LIVE NAS (no credentials were reachable at build time):
+#   * the SMB field name that carries the folder list — isolated in the override
+#     var `syno_smb_tm_folder_field` (defaults/main.yml), default "tm_folder";
+#   * the field's representation on write (assumed a JSON array of names).
+# The SURFACE task below prints the full SMB `get` response on run 1 so the real
+# field name/representation is confirmed, not guessed; the verify then makes any
+# wrong guess fail LOUDLY rather than silently converging green. If the SMB call
+# itself errors, re-run with `-e dsm_no_log=false` to see DSM's error detail and
+# adjust `syno_smb_tm_folder_field` / `dsm_api_ver_smb`.
+
+- name: "[{{ share.name }}] Read SMB service config (Time Machine folder list)"
+  ansible.builtin.include_tasks: "{{ dsm_api_call }}"
+  vars:
+    dsm_call_name: "get SMB config"
+    dsm_call_body:
+      api: SYNO.Core.FileServ.SMB
+      version: "{{ dsm_api_ver_smb }}"
+      method: get
+
+- name: "[{{ share.name }}] Record SMB config"
+  ansible.builtin.set_fact:
+    _smb_data: "{{ dsm_call_result.json.data | default({}) }}"
+
+- name: "SURFACE — full SMB get response (confirm the Time Machine folder field name)"
+  ansible.builtin.debug:
+    var: _smb_data
+  when: share_index | int == 0
+
+- name: "[{{ share.name }}] Normalise the current Time Machine folder list"
+  ansible.builtin.set_fact:
+    # The field may be a native list or a comma-separated string depending on DSM
+    # build — accept either, drop empties.
+    _tm_current: >-
+      {{ (_tm_raw if (_tm_raw is iterable and _tm_raw is not string)
+         else (_tm_raw | default('') | string | split(','))) | select | list }}
+  vars:
+    _tm_raw: "{{ _smb_data[syno_smb_tm_folder_field] | default([]) }}"
+
+- name: "[{{ share.name }}] Decide the desired Time Machine folder list"
+  ansible.builtin.set_fact:
+    _tm_present_now: "{{ _share_name in _tm_current }}"
+    _tm_desired_list: >-
+      {{ (_tm_current + [_share_name]) | unique if _share_tm
+         else (_tm_current | reject('equalto', _share_name) | list) }}
+
+- name: "[{{ share.name }}] Decide whether the Time Machine list needs changing"
+  ansible.builtin.set_fact:
+    _tm_changed: "{{ (_share_tm | bool) != (_tm_present_now | bool) }}"
+
+- name: "[{{ share.name }}] WOULD UPDATE Time Machine folders (validate-only)"
+  ansible.builtin.debug:
+    msg: >-
+      Time Machine for '{{ _share_name }}' would change (desired
+      enabled={{ _share_tm }}, currently present={{ _tm_present_now }}). New
+      folder list would be {{ _tm_desired_list }}.
+  when:
+    - _tm_changed | bool
+    - not (converge | bool)
+
+- name: "[{{ share.name }}] Update the SMB Time Machine folder list (changed + converge)"
+  ansible.builtin.include_tasks: "{{ dsm_api_call }}"
+  vars:
+    dsm_call_name: "set SMB Time Machine folders"
+    dsm_call_changed: true
+    dsm_call_body: >-
+      {{ {'api': 'SYNO.Core.FileServ.SMB', 'version': dsm_api_ver_smb, 'method': 'set',
+      syno_smb_tm_folder_field: (_tm_desired_list | to_json(separators=[',', ':']))} }}
+  when:
+    - _tm_changed | bool
+    - converge | bool
+
+# Read-back verify (only meaningful after a converge). Confirms our share is in
+# the list when desired, or absent when not.
+- name: "[{{ share.name }}] Verify Time Machine designation"
+  when: converge | bool
+  block:
+    - name: "[{{ share.name }}] Re-read SMB config to confirm"
+      ansible.builtin.include_tasks: "{{ dsm_api_call }}"
+      vars:
+        dsm_call_name: "verify SMB config"
+        dsm_call_body:
+          api: SYNO.Core.FileServ.SMB
+          version: "{{ dsm_api_ver_smb }}"
+          method: get
+
+    - name: "[{{ share.name }}] Project effective Time Machine folder list"
+      ansible.builtin.set_fact:
+        _tm_effective: >-
+          {{ (_tm_raw if (_tm_raw is iterable and _tm_raw is not string)
+             else (_tm_raw | default('') | string | split(','))) | select | list }}
+      vars:
+        _tm_raw: "{{ (dsm_call_result.json.data | default({}))[syno_smb_tm_folder_field] | default([]) }}"
+
+    - name: "[{{ share.name }}] Verify the Time Machine designation converged"
+      ansible.builtin.assert:
+        that:
+          - (_share_name in _tm_effective) == (_share_tm | bool)
+        fail_msg: >-
+          Time Machine designation for '{{ _share_name }}' did not converge:
+          desired enabled={{ _share_tm }}, but effective folder list is
+          {{ _tm_effective }}. The SMB field name assumed here
+          ('{{ syno_smb_tm_folder_field }}') is UNCONFIRMED — check the SURFACE
+          output above for the real field and set syno_smb_tm_folder_field, or
+          adjust dsm_api_ver_smb, then re-run.
+        quiet: true

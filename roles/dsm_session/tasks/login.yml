@@ -1,0 +1,69 @@
+---
+# SYNO.API.Auth login. POST (never GET) so the password never lands in a URL,
+# query string, or web-server access log. no_log because the request body holds
+# the password and the response holds the sid (architect RULE 3).
+#
+# Ported verbatim from homelab-netboot/nas/ansible/roles/dsm_session — the DSM 7.2
+# session behavior here is hard-won; do not "simplify" it. See api_call.yml's
+# header for the full create-3300 cookie-vs-_sid saga.
+- name: Authenticate to DSM (SYNO.API.Auth login)
+  ansible.builtin.uri:
+    url: "{{ dsm_entry_cgi }}"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      api: SYNO.API.Auth
+      version: "6"
+      method: login
+      account: "{{ dsm_account }}"
+      passwd: "{{ dsm_password }}"
+      otp_code: "{{ dsm_otp_code }}"
+      format: sid
+      # CSRF: when "Improve protection against cross-site request forgery" is on
+      # (it is — the DSM web UI sends an x-syno-token header), DSM requires the
+      # SynoToken on state-changing calls (Share.create, LUN create, ACL, ...);
+      # reads are not gated. Request the token here (response field data.synotoken
+      # per the DSM Login Web API Guide + N4S4) and send it as the X-SYNO-TOKEN
+      # header from the api_call funnel. client=browser mirrors the web UI.
+      enable_syno_token: "yes"
+      client: browser
+    validate_certs: "{{ dsm_validate_certs }}"
+    timeout: "{{ dsm_api_timeout }}"
+    return_content: true
+    status_code: [200]
+  register: dsm_login  # noqa: var-naming[no-role-prefix]  (session-contract var; dsm_ prefix, not dsm_session_)
+  changed_when: false
+  failed_when: false            # evaluate success in the next task, where we can show the code
+  no_log: true
+
+# Deliberately NOT no_log: the failure text carries only a numeric error code,
+# never the password, and keeping it visible is what makes a bad-credential run
+# diagnosable. A successful login prints nothing (assert is silent on pass), so
+# the sid in dsm_login.json.data.sid is never displayed here.
+- name: Assert DSM login succeeded (an administrators-group account is required)
+  ansible.builtin.assert:
+    that:
+      - dsm_login.status | default(-1) == 200
+      - dsm_login.json is defined
+      - dsm_login.json.success | default(false)
+    fail_msg: >-
+      DSM login failed (HTTP {{ dsm_login.status | default('?') }}, DSM error
+      {{ dsm_login.json.error.code | default('n/a') }}). Common auth codes:
+      400 no such account / wrong password; 403 2FA required (export
+      DSM_OTP_CODE); 404/406 2FA or permission; 400+ the account lacks API
+      access. The account MUST be in the DSM 'administrators' group.
+    quiet: true
+
+# dsm_sid is a cross-role session-contract var (used by api_call, logout, and the
+# play), intentionally prefixed dsm_ not dsm_session_.
+- name: Capture the DSM session id  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    dsm_sid: "{{ dsm_login.json.data.sid }}"
+  no_log: true
+
+# CSRF token for state-changing calls (see enable_syno_token above). Absent if
+# CSRF protection is off; default('') keeps the X-SYNO-TOKEN header harmless then.
+- name: Capture the DSM CSRF token (SynoToken)  # noqa: var-naming[no-role-prefix]
+  ansible.builtin.set_fact:
+    dsm_syno_token: "{{ dsm_login.json.data.synotoken | default('') }}"
+  no_log: true

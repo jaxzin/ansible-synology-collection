@@ -1,0 +1,81 @@
+---
+argument_specs:
+  main:
+    short_description: Manage DSM shared folders via the DSM HTTP API (create-if-absent, verify-existing).
+    description:
+      - Drives the DSM Web API (entry.cgi) from the control node to converge each
+        declared shared folder. Replaces the unreliable C(synoshare) CLI path
+        (which fails on DSM 7.2 with C(share_is_acl_share.c:49)).
+      - Validate-only by default. Pass C(-e converge=true) to apply changes.
+    options:
+      syno_shares:
+        type: "list"
+        elements: "dict"
+        required: true
+        description: "List of shared folders to manage."
+        options:
+          name:
+            type: "str"
+            required: true
+            description: "Shared-folder name (also the folder created under the volume)."
+          description:
+            type: "str"
+            required: false
+            default: ""
+            description: "Shared-folder description. DSM rejects descriptions longer than 64 characters at create time."
+          volume:
+            type: "str"
+            required: false
+            description:
+              - "Volume root the share lives on, e.g. C(/volume1). The folder is created at C(<volume>/<name>)."
+              - "If omitted, the volume is derived from the first path segment of C(path) (e.g. C(/volume3/media) -> C(/volume3))."
+          path:
+            type: "str"
+            required: false
+            description:
+              - "Legacy full share path (e.g. C(/volume3/media)). Retained for backward compatibility; the volume is derived from its first segment."
+              - "Prefer C(volume) for new declarations."
+          rights:
+            type: "dict"
+            required: false
+            description: "Local-user access rights. Only the named users are set; other (e.g. admin) permissions are left untouched."
+            options:
+              RW:
+                type: "list"
+                elements: "str"
+                required: false
+                default: []
+                description: "Local users granted read-write access."
+              RO:
+                type: "list"
+                elements: "str"
+                required: false
+                default: []
+                description: "Local users granted read-only access."
+          recycle:
+            type: "bool"
+            required: false
+            default: false
+            description: "Enable the share's recycle bin."
+          enable_time_machine:
+            type: "bool"
+            required: false
+            default: false
+            description:
+              - "Designate this share as an SMB Time Machine target."
+              - "Implemented as the global SYNO.Core.FileServ.SMB Time Machine folder list; only this share's membership is changed."
+          quota_gb:
+            type: "int"
+            required: false
+            description:
+              - "Per-share quota. Sent as the DSM C(share_quota) field."
+              - "NOTE: the field's unit was assumed to be GB at build time and is UNCONFIRMED against a live NAS. Confirm the effective quota in the DSM UI on first run; see the role README."
+      converge:
+        type: "bool"
+        required: false
+        default: false
+        description: "When false (default) the role only reads and reports a diff. Set true (usually via C(-e converge=true)) to apply changes."
+      dsm_host:
+        type: "str"
+        required: true
+        description: "DSM address (the NAS), e.g. C(192.168.10.7). Consumed by the tafeen.synology.dsm_session funnel."

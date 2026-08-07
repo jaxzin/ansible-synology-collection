@@ -1,0 +1,31 @@
+---
+# DSM HTTP-API session contract. These defaults are consumed by login.yml,
+# api_call.yml and logout.yml, and by any role that drives DSM through the
+# api_call funnel (e.g. syno_add_shares). A consumer/playbook overrides
+# dsm_host (and, if needed, port/scheme) for its own NAS; credentials are always
+# sourced from the ENVIRONMENT at run time and are NEVER written to the repo.
+
+# --- DSM endpoint -------------------------------------------------------------
+dsm_host: "{{ undef(hint='Set dsm_host to the NAS address (e.g. 192.168.10.7)') }}"
+dsm_port: 5001
+dsm_scheme: "https"
+dsm_entry_cgi: "{{ dsm_scheme }}://{{ dsm_host }}:{{ dsm_port }}/webapi/entry.cgi"
+
+# DSM ships a self-signed certificate on :5001. Leave false for a LAN NAS, or set
+# true (and trust the NAS CA on the control node) once you have pinned a real
+# certificate. Never disable this to work around a genuine cert error silently.
+dsm_validate_certs: false
+dsm_api_timeout: 30
+
+# no_log guard for every API-calling task — the request carries the session id
+# (sid) in a Cookie header. Default true (RULE 3). Flip to false for a
+# troubleshooting run to reveal request/response detail:
+#   ansible-playbook playbook.yml -e dsm_no_log=false
+dsm_no_log: true
+
+# --- Runtime credentials (env-sourced; empty if unset -> the consumer asserts
+# and stops before making any call). An administrators-group DSM account is
+# required (Share/Permission/SMB APIs are admin-gated).
+dsm_account: "{{ lookup('ansible.builtin.env', 'DSM_ACCOUNT') }}"
+dsm_password: "{{ lookup('ansible.builtin.env', 'DSM_PASSWORD') }}"
+dsm_otp_code: "{{ lookup('ansible.builtin.env', 'DSM_OTP_CODE') }}"

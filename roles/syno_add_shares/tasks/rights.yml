@@ -1,0 +1,142 @@
+---
+# Converge RW/RO rights for one share via SYNO.Core.Share.Permission
+# (list/set), user_group_type=local_user. API shape confirmed from synology-api
+# (set_folder_permissions / get_folder_permissions).
+#
+# Semantics: we set ONLY the declared RW/RO users (upsert). DSM leaves users we
+# do not name untouched, so implicit admin/administrators access is preserved
+# (RULE 2 — we touch only what this share declares). Verify asserts each declared
+# user ends up with exactly its declared access.
+
+- name: "[{{ share.name }}] Skip rights (none declared)"
+  ansible.builtin.debug:
+    msg: "No RW/RO users declared for '{{ _share_name }}'; leaving permissions untouched."
+  when: (_share_rw | length + _share_ro | length) == 0
+
+- name: "[{{ share.name }}] Rights block"
+  when: (_share_rw | length + _share_ro | length) > 0
+  block:
+    # Desired permission entries as a real list of dicts (built as JSON then
+    # parsed so it is a true list, not a Jinja string repr).
+    - name: "[{{ share.name }}] Build desired permission set"
+      ansible.builtin.set_fact:
+        _perm_desired: "{{ _perm_json | from_json }}"
+      vars:
+        _perm_json: >-
+          [
+          {% for u in _share_rw %}
+          {"name": {{ u | to_json }}, "is_readonly": false, "is_writable": true, "is_deny": false, "is_custom": false}{% if not loop.last or (_share_ro | length > 0) %},{% endif %}
+          {% endfor %}
+          {% for u in _share_ro %}
+          {"name": {{ u | to_json }}, "is_readonly": true, "is_writable": false, "is_deny": false, "is_custom": false}{% if not loop.last %},{% endif %}
+          {% endfor %}
+          ]
+
+    - name: "[{{ share.name }}] Read current share permissions (local users)"
+      ansible.builtin.include_tasks: "{{ dsm_api_call }}"
+      vars:
+        dsm_call_name: "list permissions for {{ _share_name }}"
+        dsm_call_body:
+          api: SYNO.Core.Share.Permission
+          version: "{{ dsm_api_ver_share_perm }}"
+          method: list
+          name: "{{ _share_name }}"
+          action: enum
+          user_group_type: local_user
+          offset: 0
+          limit: 200
+
+    - name: "[{{ share.name }}] Record current permissions"
+      ansible.builtin.set_fact:
+        _perm_current: "{{ dsm_call_result.json.data.items | default([]) }}"
+
+    - name: "[{{ share.name }}] SURFACE — current permission items (confirm field shape)"
+      ansible.builtin.debug:
+        var: _perm_current
+
+    # Project both sides onto {name, is_readonly, is_writable} for the declared
+    # users only, so the diff/verify compare apples-to-apples.
+    - name: "[{{ share.name }}] Project desired + current permissions for the diff"
+      ansible.builtin.set_fact:
+        _perm_desired_proj: "{{ _pd_json | from_json }}"
+        _perm_current_proj: "{{ _pc_json | from_json }}"
+      vars:
+        _pd_json: >-
+          [{% for p in _perm_desired %}{"name": {{ p.name | to_json }}, "is_readonly": {{ p.is_readonly | to_json }}, "is_writable": {{ p.is_writable | to_json }}}{% if not loop.last %},{% endif %}{% endfor %}]
+        _pc_json: >-
+          [{% for p in _perm_desired %}
+          {% set c = (_perm_current | selectattr('name', 'equalto', p.name) | list | first) | default({}, true) %}
+          {"name": {{ p.name | to_json }}, "is_readonly": {{ (c.is_readonly | default(false)) | to_json }}, "is_writable": {{ (c.is_writable | default(false)) | to_json }}}{% if not loop.last %},{% endif %}
+          {% endfor %}]
+
+    - name: "[{{ share.name }}] Decide whether rights need updating"
+      ansible.builtin.set_fact:
+        _perm_changed: "{{ (_perm_current_proj | sort(attribute='name')) != (_perm_desired_proj | sort(attribute='name')) }}"
+
+    - name: "[{{ share.name }}] WOULD SET rights (validate-only)"
+      ansible.builtin.debug:
+        msg: "Rights for '{{ _share_name }}' differ; would set {{ _perm_desired_proj }}."
+      when:
+        - _perm_changed | bool
+        - not (converge | bool)
+
+    - name: "[{{ share.name }}] Set share permissions (changed + converge)"
+      ansible.builtin.include_tasks: "{{ dsm_api_call }}"
+      vars:
+        dsm_call_name: "set permissions for {{ _share_name }}"
+        dsm_call_changed: true
+        dsm_call_body:
+          api: SYNO.Core.Share.Permission
+          version: "{{ dsm_api_ver_share_perm }}"
+          method: set
+          name: "{{ _share_name }}"
+          user_group_type: local_user
+          # Whole declared set as a compact JSON array string.
+          permissions: "{{ _perm_desired | to_json(separators=[',', ':']) }}"
+      when:
+        - _perm_changed | bool
+        - converge | bool
+
+    # Read-back verify: each declared user ends up with EXACTLY its declared
+    # access. Only meaningful after a converge (in validate-only we did not set).
+    - name: "[{{ share.name }}] Verify rights"
+      when: converge | bool
+      block:
+        - name: "[{{ share.name }}] Re-read permissions to confirm"
+          ansible.builtin.include_tasks: "{{ dsm_api_call }}"
+          vars:
+            dsm_call_name: "verify permissions for {{ _share_name }}"
+            dsm_call_body:
+              api: SYNO.Core.Share.Permission
+              version: "{{ dsm_api_ver_share_perm }}"
+              method: list
+              name: "{{ _share_name }}"
+              action: enum
+              user_group_type: local_user
+              offset: 0
+              limit: 200
+
+        - name: "[{{ share.name }}] Project effective permissions for the declared users"
+          ansible.builtin.set_fact:
+            _perm_effective_proj: "{{ _pe_json | from_json }}"
+          vars:
+            _perm_effective: "{{ dsm_call_result.json.data.items | default([]) }}"
+            _pe_json: >-
+              [{% for p in _perm_desired %}
+              {% set c = (_perm_effective | selectattr('name', 'equalto', p.name) | list | first) | default({}, true) %}
+              {"name": {{ p.name | to_json }},
+              "is_readonly": {{ (c.is_readonly | default(false)) | to_json }},
+              "is_writable": {{ (c.is_writable | default(false)) | to_json }}}{% if not loop.last %},{% endif %}
+              {% endfor %}]
+
+        - name: "[{{ share.name }}] Verify effective rights match the declared rights"
+          ansible.builtin.assert:
+            that:
+              - (_perm_effective_proj | sort(attribute='name')) == (_perm_desired_proj | sort(attribute='name'))
+            fail_msg: >-
+              Rights for '{{ _share_name }}' did not converge. Desired
+              {{ _perm_desired_proj | sort(attribute='name') }}; effective
+              {{ _perm_effective_proj | sort(attribute='name') }}. Either DSM
+              ignored part of the set payload (correct the Permission set shape)
+              or a declared user does not exist on the NAS.
+            quiet: true
