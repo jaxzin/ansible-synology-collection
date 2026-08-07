@@ -26,10 +26,10 @@
       vars:
         syno_shares:
           - name: "Time Machine Backups"
-            description: "Time Machine target for MacBook"
+            description: "Time Machine target"
             volume: /volume1
             rights:
-              RW: [jaxzin]
+              RW: [alice]
             enable_time_machine: true
-            quota_gb: 4000          # ~4 TB of the 14 TB pool; adjust if needed
+            quota_gb: 4000          # example per-share quota; set to your volume
             recycle: false

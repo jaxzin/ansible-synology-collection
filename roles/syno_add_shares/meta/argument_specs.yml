@@ -78,4 +78,4 @@ argument_specs:
       dsm_host:
         type: "str"
         required: true
-        description: "DSM address (the NAS), e.g. C(192.168.10.7). Consumed by the tafeen.synology.dsm_session funnel."
+        description: "DSM address (the NAS), e.g. C(nas.example.lan). Consumed by the tafeen.synology.dsm_session funnel."

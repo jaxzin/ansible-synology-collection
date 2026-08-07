@@ -6,7 +6,7 @@
 # sourced from the ENVIRONMENT at run time and are NEVER written to the repo.
 
 # --- DSM endpoint -------------------------------------------------------------
-dsm_host: "{{ undef(hint='Set dsm_host to the NAS address (e.g. 192.168.10.7)') }}"
+dsm_host: "{{ undef(hint='Set dsm_host to the NAS address (e.g. nas.example.lan)') }}"
 dsm_port: 5001
 dsm_scheme: "https"
 dsm_entry_cgi: "{{ dsm_scheme }}://{{ dsm_host }}:{{ dsm_port }}/webapi/entry.cgi"

@@ -2,7 +2,7 @@
 # DSM endpoint for the test converge. Non-secret. Matches the homelab-netboot
 # NAS. Credentials are NEVER put here — they are sourced from the environment
 # (DSM_ACCOUNT, DSM_PASSWORD, optional DSM_OTP_CODE) by the dsm_session role.
-dsm_host: "192.168.10.7"
+dsm_host: "nas.example.lan"
 dsm_port: 5001
 dsm_scheme: "https"
 # DSM's self-signed cert on :5001 (LAN NAS). See dsm_session/defaults for the note.

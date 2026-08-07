@@ -39,10 +39,10 @@ example.
 ```yaml
 syno_shares:
   - name: "Time Machine Backups"      # required
-    description: "Time Machine target for MacBook"   # <= 64 chars
+    description: "Time Machine target"   # <= 64 chars
     volume: /volume1                  # volume root; or use legacy `path: /volume1/foo`
     rights:
-      RW: [jaxzin]                    # local users, read-write
+      RW: [alice]                    # local users, read-write
       RO: [guest]                     # local users, read-only
     recycle: false                    # enable the share recycle bin
     enable_time_machine: true         # SMB Time Machine target (see caveat)
@@ -82,7 +82,7 @@ so these are confirmed, not guessed.
   connection: local
   gather_facts: false
   vars:
-    dsm_host: "192.168.10.7"
+    dsm_host: "nas.example.lan"
   tasks:
     - name: Converge shares
       ansible.builtin.include_role:
