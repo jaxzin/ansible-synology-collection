@@ -1,0 +1,19 @@
+---
+# Best-effort session teardown. Runs from the play's always: block so a failed
+# converge still releases the DSM session (architect RULE 3). Never fails the
+# run (failed_when: false) — a logout hiccup must not mask the real result.
+- name: Log out of DSM (SYNO.API.Auth logout)
+  ansible.builtin.uri:
+    url: "{{ dsm_entry_cgi }}"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      api: SYNO.API.Auth
+      version: "6"
+      method: logout
+      _sid: "{{ dsm_sid }}"
+    validate_certs: "{{ dsm_validate_certs }}"
+    timeout: "{{ dsm_api_timeout }}"
+  changed_when: false
+  failed_when: false
+  no_log: true

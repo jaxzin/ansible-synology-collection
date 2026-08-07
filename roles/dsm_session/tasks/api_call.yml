@@ -1,0 +1,88 @@
+---
+# Reusable DSM entry.cgi call. Routing EVERY API call through here centralises
+# two invariants so no caller can forget them:
+#
+#   * the session is injected here and no_log'd (RULE 3) — the sid rides in the
+#     `Cookie: id=<sid>` header (see below) and no_log hides the whole task;
+#   * DSM returns HTTP 200 even on an API error (body: success:false + an error
+#     code), so the success check lives here once instead of in every caller.
+#
+# WHY A COOKIE, NOT AN `_sid` BODY PARAM (root cause of the create-3300 saga):
+# On DSM 7.2 the SYNO.Core.Share `create` WRITE (a JSON request-format path) does
+# NOT honor an `_sid` body/query param — it resolves the session from the `id`
+# session cookie. Reads (method=list) DO accept `_sid`, which masked this for a
+# long time (list succeeded, create returned a bare 3300). Verified against both
+# known-good drivers reading live source: synology-csi attaches Cookie{id} on
+# EVERY call and never sends `_sid`; synology-api routes DSM-7.2 creates through
+# its Cookie `id=` path (request_webapi_data) while keeping list on the `_sid`
+# path — deliberately reproducing the exact list-OK / create-3300 asymmetry.
+# synology-api logs in with the identical enable_syno_token=yes + client=browser
+# mode we use and still succeeds via the cookie, so the login mode and the
+# SynoToken are NOT the gate — the session TRANSPORT is. We therefore carry the
+# session as a Cookie header on ALL calls (harmless on reads, required on the
+# write) and DROP `_sid` from the body (a stray `_sid` alongside the cookie can
+# re-trip the write-path guard). Origin/Referer/x-syno-hash are NOT required
+# (synology-api omits them and still succeeds).
+#
+# Caller contract (pass as task vars on the include):
+#   dsm_call_name    : str  — human label (shown in output; MUST contain no secret)
+#   dsm_call_body    : dict — api/method/version + params, WITHOUT _sid
+#   dsm_call_changed : bool — does a successful call mean state changed?
+#                             Default false (reads). Mutating callers pass true
+#                             AND gate the include with `when:` on a real diff —
+#                             that gate is where idempotency lives: on a
+#                             no-change run the include is skipped entirely.
+#   dsm_call_timeout : int  — optional per-call HTTP timeout (seconds). Defaults
+#                             to dsm_api_timeout; bump it for a slow-ALLOCATING
+#                             write (e.g. iSCSI LUN create reserves volume space
+#                             and can exceed the default) so it does not
+#                             read-timeout with a transport HTTP -1.
+#
+# Returns: dsm_call_result — .json is the DSM response (sid-free; safe to debug).
+- name: "DSM API > {{ dsm_call_name }}"
+  ansible.builtin.uri:
+    url: "{{ dsm_entry_cgi }}"
+    method: POST
+    body_format: form-urlencoded
+    body: "{{ dsm_call_body }}"   # NO _sid — session rides in the Cookie header below
+    headers:
+      # Session transport (see header block above): the sid as the `id` cookie.
+      Cookie: "id={{ dsm_sid }}"
+      # CSRF token (RULE 3 companion): DSM requires it on state-changing calls when
+      # CSRF protection is on. Harmless on reads and when the token is empty.
+      X-SYNO-TOKEN: "{{ dsm_syno_token | default('') }}"
+    validate_certs: "{{ dsm_validate_certs }}"
+    timeout: "{{ dsm_call_timeout | default(dsm_api_timeout) }}"
+    return_content: true
+    status_code: [200]
+  # dsm_call_result is a deliberate cross-role return contract (callers read
+  # dsm_call_result.json), intentionally prefixed dsm_ not dsm_session_.
+  register: dsm_call_result  # noqa: var-naming[no-role-prefix]
+  changed_when: dsm_call_changed | default(false)
+  failed_when: false            # never hard-fail here; the assert below reports uniformly
+  no_log: "{{ dsm_no_log }}"    # Cookie header carries the sid (RULE 3)
+
+# Troubleshooting aid: on a FAILED call, surface DSM's full response so a shape
+# mismatch shows its real detail (error.errors[], messages) instead of only the
+# numeric code. Safe: .json is the RESPONSE body (sid-free — the sid lives only in
+# the request). Gated on the operator opting into troubleshooting
+# (-e dsm_no_log=false); silent on success and on normal runs.
+- name: "DSM API detail (failed call, troubleshooting only) > {{ dsm_call_name }}"
+  ansible.builtin.debug:
+    var: dsm_call_result.json
+  when:
+    - not (dsm_no_log | bool)
+    - not (dsm_call_result.json.success | default(false))
+
+- name: "DSM API OK > {{ dsm_call_name }}"
+  ansible.builtin.assert:
+    that:
+      - dsm_call_result.status | default(-1) == 200
+      - dsm_call_result.json is defined
+      - dsm_call_result.json.success | default(false)
+    fail_msg: >-
+      DSM API '{{ dsm_call_name }}' failed — HTTP
+      {{ dsm_call_result.status | default('?') }}; DSM error code
+      {{ dsm_call_result.json.error.code | default('n/a') }}; transport:
+      {{ dsm_call_result.msg | default('n/a') }}.
+    quiet: true
