@@ -1,0 +1,7 @@
+---
+- name: Converge each docker-compose project
+  ansible.builtin.include_tasks: deploy_project.yml
+  loop: "{{ syno_compose_projects }}"
+  loop_control:
+    loop_var: project
+    label: "{{ project.name }}"
