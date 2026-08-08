@@ -1,0 +1,68 @@
+---
+# Manage a single account. Loop var: _user = { name, state }.
+- name: "Resolve effective state for '{{ _user.name }}'"
+  ansible.builtin.set_fact:
+    _state: "{{ _user.state | default('present') }}"
+
+# --- present: declarative no-op (this transport cannot create accounts) --------
+- name: "Keep declared-present account (no-op) '{{ _user.name }}'"
+  when: _state == 'present'
+  ansible.builtin.set_fact:
+    syno_manage_accounts_results: >-
+      {{ syno_manage_accounts_results
+         + [ {'name': _user.name, 'state': 'present', 'action': 'kept', 'changed': false, 'rc': none} ] }}
+
+# --- absent: defense in depth — refuse protected accounts BEFORE any ssh -------
+- name: "Refuse to retire protected account '{{ _user.name }}'"
+  when:
+    - _state == 'absent'
+    - _user.name in (syno_protected_users_builtin + syno_protected_users)
+  ansible.builtin.fail:
+    msg: >-
+      Refusing to retire protected account '{{ _user.name }}': it is on the
+      in-role protected denylist
+      ({{ (syno_protected_users_builtin + syno_protected_users) | join(', ') }}).
+
+# --- absent: invoke the forced-command transport ------------------------------
+- name: "Retire '{{ _user.name }}'"
+  when: _state == 'absent'
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -i
+      - "{{ _syno_keydir.path }}/id_transport"
+      - -p
+      - "{{ syno_ssh_port | string }}"
+      - -o
+      - StrictHostKeyChecking=accept-new
+      - "{{ syno_deploy_user }}@{{ syno_ssh_host }}"
+      - "retire {{ _user.name }}"
+  register: _retire
+  # Only exit 0 (an actual delete) is a change; exit 4 (already gone) is green.
+  changed_when: _retire.rc == 0
+  # We map every exit code explicitly below rather than letting rc!=0 fail here.
+  failed_when: false
+
+# --- absent: map the wrapper exit code -> outcome (or fail loudly) -------------
+- name: "Interpret retire result for '{{ _user.name }}'"
+  when: _state == 'absent'
+  block:
+    - name: "Fail loudly on a refused/unexpected retire of '{{ _user.name }}'"
+      when: _retire.rc not in [0, 4]
+      ansible.builtin.fail:
+        msg: >-
+          Retire of '{{ _user.name }}' failed (exit {{ _retire.rc }}):
+          {{ {2: 'wrapper rejected the command (bad/arbitrary command) — transport misuse',
+              3: 'wrapper refused a protected account'}
+             .get(_retire.rc, 'unexpected exit code from the transport') }}.
+          stderr: {{ _retire.stderr | default('') | trim }}
+
+    - name: "Record retire outcome for '{{ _user.name }}'"
+      ansible.builtin.set_fact:
+        syno_manage_accounts_results: >-
+          {{ syno_manage_accounts_results
+             + [ {'name': _user.name,
+                  'state': 'absent',
+                  'action': ({0: 'deleted', 4: 'already_absent'}[_retire.rc]),
+                  'changed': (_retire.rc == 0),
+                  'rc': _retire.rc} ] }}

@@ -1,0 +1,62 @@
+---
+argument_specs:
+  main:
+    short_description: Manage Synology DSM accounts over an SSH forced-command transport.
+    description:
+      - Retires (deletes) DSM user accounts declared C(state=absent) by invoking a
+        pre-provisioned SSH forced-command key on the NAS.
+      - C(state=present) is a declarative no-op — this role does not create
+        accounts (the delete-only transport cannot); it simply leaves declared-present
+        users untouched and converges green.
+      - Enforces its own protected-account denylist before ever contacting the NAS.
+    options:
+      syno_users:
+        type: list
+        elements: dict
+        required: true
+        description: Accounts to manage.
+        options:
+          name:
+            type: str
+            required: true
+            description: DSM account name.
+          state:
+            type: str
+            required: false
+            default: present
+            choices: [present, absent]
+            description: C(absent) retires the account; C(present) is a no-op.
+      syno_ssh_host:
+        type: str
+        required: true
+        description: Hostname or IP the forced-command key connects to.
+      syno_ssh_port:
+        type: int
+        required: false
+        default: 22
+        description: SSH port for the transport.
+      syno_deploy_user:
+        type: str
+        required: true
+        description: The deploy account the forced-command key authenticates as.
+      syno_ssh_private_key:
+        type: str
+        required: true
+        description:
+          - Contents (PEM) of the forced-command private key. Staged to a C(0600)
+            temp file for the run and removed afterwards.
+      syno_protected_users:
+        type: list
+        elements: str
+        required: false
+        default: []
+        description:
+          - Additional account names this role refuses to retire. Merged with
+            (does not replace) C(syno_protected_users_builtin).
+      syno_protected_users_builtin:
+        type: list
+        elements: str
+        required: false
+        description:
+          - The always-on generic denylist (C(admin), C(root), C(guest),
+            C(anonymous)). Override only to change the built-in protected set.
