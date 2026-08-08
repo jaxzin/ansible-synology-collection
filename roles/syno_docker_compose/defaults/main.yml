@@ -1,0 +1,22 @@
+---
+# One or more docker-compose projects to converge on a Synology (Container
+# Manager / Docker package) host. Required — the caller must define it.
+syno_compose_projects: "{{ undef(hint='You must specify syno_compose_projects') }}"
+
+# Synology ships the Docker CLI (with the compose v2 plugin) here, and it is
+# NOT on a non-interactive SSH PATH — so the role calls it by absolute path.
+syno_docker_bin: /usr/local/bin/docker
+
+# Per-project keys (see README):
+#   name         (required)  project name (compose project + default dir leaf)
+#   compose_src  (required)  path to the compose file in the CONSUMER's files/ —
+#                            copied to <path>/docker-compose.yml
+#   path         (opt)       on-host project dir; default /volume1/docker/<name>
+#   state        (opt)       present (default) -> `up -d`; absent -> `down`
+#   pull         (opt)       image pull policy: always | missing (default) | never
+#   env_src      (opt)       path to a .env file in the CONSUMER's files/ —
+#                            copied to <path>/.env (compose reads it automatically)
+#
+# NOTE: this role does NOT use become. Synology's docker is authorized by
+# docker-group membership, not root, so the connecting user must be in the
+# `docker` group (Synology sudo needs a password that breaks forced-command SSH).

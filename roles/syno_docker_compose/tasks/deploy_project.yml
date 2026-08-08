@@ -1,0 +1,69 @@
+---
+# Converge ONE compose project. Called per item by tasks/main.yml.
+- name: "{{ project.name }} | validate required keys"
+  ansible.builtin.assert:
+    that:
+      - project.name is defined and project.name | length > 0
+      - project.compose_src is defined and project.compose_src | length > 0
+      - (project.state | default('present')) in ['present', 'absent']
+      - (project.pull | default('missing')) in ['always', 'missing', 'never']
+    quiet: true
+    fail_msg: "invalid syno_compose_projects entry {{ project | to_json }}"
+
+- name: "{{ project.name }} | resolve project facts"
+  ansible.builtin.set_fact:
+    _proj_dir: "{{ project.path | default('/volume1/docker/' ~ project.name) }}"
+    _proj_state: "{{ project.state | default('present') }}"
+    _proj_pull: "{{ project.pull | default('missing') }}"
+
+- name: "{{ project.name }} | ensure project directory"
+  ansible.builtin.file:
+    path: "{{ _proj_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: "{{ project.name }} | publish compose file"
+  ansible.builtin.copy:
+    src: "{{ project.compose_src }}"
+    dest: "{{ _proj_dir }}/docker-compose.yml"
+    mode: "0644"
+  register: _compose_file
+
+- name: "{{ project.name }} | publish .env file"
+  when: project.env_src is defined
+  ansible.builtin.copy:
+    src: "{{ project.env_src }}"
+    dest: "{{ _proj_dir }}/.env"
+    mode: "0600"
+  register: _env_file
+
+# docker compose logs progress to STDERR; "up-to-date" containers emit no
+# Started/Recreated/Created/Pulled lines, so their absence => no change. A
+# changed compose/.env file also forces changed (the recreate may be a no-op
+# in text but the on-disk definition moved).
+- name: "{{ project.name }} | docker compose up -d"
+  when: _proj_state == 'present'
+  ansible.builtin.command:
+    cmd: >-
+      {{ syno_docker_bin }} compose
+      --project-name {{ project.name }}
+      --file {{ _proj_dir }}/docker-compose.yml
+      up --detach --pull {{ _proj_pull }} --remove-orphans
+  register: _compose_up
+  changed_when: >-
+    ('Started' in _compose_up.stderr) or ('Recreated' in _compose_up.stderr)
+    or ('Created' in _compose_up.stderr) or ('Pulled' in _compose_up.stderr)
+    or (_compose_file is changed) or ((_env_file | default({})) is changed)
+
+- name: "{{ project.name }} | docker compose down"
+  when: _proj_state == 'absent'
+  ansible.builtin.command:
+    cmd: >-
+      {{ syno_docker_bin }} compose
+      --project-name {{ project.name }}
+      --file {{ _proj_dir }}/docker-compose.yml
+      down
+  register: _compose_down
+  changed_when: >-
+    ('Removing' in _compose_down.stderr) or ('Removed' in _compose_down.stderr)
+    or ('Stopping' in _compose_down.stderr) or ('Stopped' in _compose_down.stderr)
