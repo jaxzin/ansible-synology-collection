@@ -1,0 +1,26 @@
+---
+# Accounts to manage. Each item: { name: <str>, state: present|absent }.
+#   - absent  -> retire (delete) the account over the SSH forced-command transport
+#   - present -> declarative no-op (this transport cannot create accounts; see README)
+syno_users: "{{ undef(hint='You must specify syno_users: a list of { name, state }') }}"
+
+# --- Transport (a pre-provisioned SSH forced-command key; see README) ---------
+# The host the forced-command key connects to.
+syno_ssh_host: "{{ undef(hint='You must specify syno_ssh_host (the DSM SSH host)') }}"
+syno_ssh_port: 22
+# The deploy account the forced-command key authenticates as.
+syno_deploy_user: "{{ undef(hint='You must specify syno_deploy_user (the forced-command deploy account)') }}"
+# PEM contents of the forced-command private key. Staged to a 0600 temp file for
+# the run and removed afterwards; never written to logs.
+syno_ssh_private_key: "{{ undef(hint='You must specify syno_ssh_private_key (contents of the forced-command private key)') }}"
+
+# --- In-role protected-account denylist (defense in depth) --------------------
+# The built-in generic set is ALWAYS enforced; consumers ADD site-specific names
+# via syno_protected_users (the two lists are merged, not replaced). This is a
+# second line of defence in addition to whatever the NAS-side wrapper enforces.
+syno_protected_users_builtin:
+  - admin
+  - root
+  - guest
+  - anonymous
+syno_protected_users: []

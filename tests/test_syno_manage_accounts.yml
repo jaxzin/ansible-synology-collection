@@ -1,0 +1,300 @@
+---
+# Self-contained mutation test for tafeen.synology.syno_manage_accounts.
+#
+# No NAS required: a mock `ssh` on PATH (tests/mocks/mock_ssh.sh) stands in for
+# the NAS-side forced-command wrapper and returns the same exit codes, so the
+# role's exit-code -> outcome mapping and its in-role protected-account denylist
+# can be verified locally.
+#
+#   ansible-playbook --syntax-check tests/test_syno_manage_accounts.yml
+#   ansible-playbook tests/test_syno_manage_accounts.yml
+#
+# A green run proves:
+#   * absent + user exists        -> rc0 -> deleted, changed
+#   * absent + user already gone  -> rc4 -> idempotent success, changed=0
+#   * absent + wrapper-protected  -> rc3 -> FAIL loudly
+#   * absent + bad command        -> rc2 -> FAIL loudly
+#   * present                     -> no ssh call, changed=0 (no-op)
+#   * absent + in-role denylist   -> FAIL before any ssh call (defense in depth)
+#   * denylist is consumer-extensible via syno_protected_users
+- name: Mocked-transport unit tests for tafeen.synology.syno_manage_accounts
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  environment: "{{ _test_env | default({}) }}"
+  vars:
+    # Not a real key — the mock ssh never reads it; the role only needs a value.
+    _dummy_key: |
+      -----BEGIN OPENSSH PRIVATE KEY-----
+      dummy-key-for-tests-only
+      -----END OPENSSH PRIVATE KEY-----
+    # Transport inputs, shared by every case (play vars override role defaults).
+    syno_ssh_host: nas.example.lan
+    syno_deploy_user: dsm-retire
+    syno_ssh_private_key: "{{ _dummy_key }}"
+  tasks:
+    - name: Scratch dir for the mock transport
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: syno-mgmt-test
+      register: _scratch
+
+    - name: Install mock ssh as the first `ssh` on PATH
+      ansible.builtin.copy:
+        src: mocks/mock_ssh.sh
+        dest: "{{ _scratch.path }}/ssh"
+        mode: "0755"
+
+    - name: Ensure an (empty) call log exists
+      ansible.builtin.copy:
+        content: ""
+        dest: "{{ _scratch.path }}/calls.log"
+        mode: "0644"
+
+    - name: Point the play (and the role's ssh) at the mock
+      ansible.builtin.set_fact:
+        _test_env:
+          PATH: "{{ _scratch.path }}:{{ ansible_env.PATH }}"
+          MOCK_SSH_LOG: "{{ _scratch.path }}/calls.log"
+          MOCK_SSH_STATE: "{{ _scratch.path }}/state"
+        _calls_log: "{{ _scratch.path }}/calls.log"
+
+    # ------------------------------------------------------------------ #
+    # rc0: absent on an existing user -> deleted + changed
+    # ------------------------------------------------------------------ #
+    - name: "CASE delete-existing"
+      ansible.builtin.include_role:
+        name: syno_manage_accounts
+      vars:
+        syno_users:
+          - { name: deleteme, state: absent }
+
+    - name: "ASSERT delete-existing -> deleted, changed, rc0"
+      vars:
+        _r: "{{ syno_manage_accounts_results | selectattr('name', 'equalto', 'deleteme') | first }}"
+      ansible.builtin.assert:
+        that:
+          # Real Ansible task status (catches a wrong changed_when / rc mapping).
+          - _retire.rc == 0
+          - _retire.changed | bool
+          # Recorded outcome + that the command was actually attempted.
+          - _r.action == 'deleted'
+          - _r.changed | bool
+          - _r.rc == 0
+          - "'retire deleteme' in lookup('file', _calls_log)"
+        fail_msg: "expected deleteme deleted+changed, got {{ _r }}"
+        success_msg: "delete-existing OK"
+
+    # ------------------------------------------------------------------ #
+    # rc4: absent on a user that never existed -> idempotent success
+    # ------------------------------------------------------------------ #
+    - name: "CASE no-such-user"
+      ansible.builtin.include_role:
+        name: syno_manage_accounts
+      vars:
+        syno_users:
+          - { name: ghost, state: absent }
+
+    - name: "ASSERT no-such-user -> already_absent, changed=0, rc4"
+      vars:
+        _r: "{{ syno_manage_accounts_results | selectattr('name', 'equalto', 'ghost') | first }}"
+      ansible.builtin.assert:
+        that:
+          # Real Ansible task status: rc4 must NOT be a change.
+          - _retire.rc == 4
+          - not (_retire.changed | bool)
+          - _r.action == 'already_absent'
+          - not (_r.changed | bool)
+          - _r.rc == 4
+        fail_msg: "expected ghost already_absent+unchanged, got {{ _r }}"
+        success_msg: "no-such-user OK"
+
+    # ------------------------------------------------------------------ #
+    # idempotency: retire the same user again -> rc4 -> changed=0
+    # ------------------------------------------------------------------ #
+    - name: "CASE idempotency (retire deleteme again)"
+      ansible.builtin.include_role:
+        name: syno_manage_accounts
+      vars:
+        syno_users:
+          - { name: deleteme, state: absent }
+
+    - name: "ASSERT idempotency -> already_absent, changed=0"
+      vars:
+        _r: "{{ syno_manage_accounts_results | selectattr('name', 'equalto', 'deleteme') | first }}"
+      ansible.builtin.assert:
+        that:
+          # The second retire must be a green no-op (changed=0).
+          - _retire.rc == 4
+          - not (_retire.changed | bool)
+          - _r.action == 'already_absent'
+          - not (_r.changed | bool)
+          - _r.rc == 4
+        fail_msg: "second retire of deleteme should be idempotent, got {{ _r }}"
+        success_msg: "idempotency OK"
+
+    # ------------------------------------------------------------------ #
+    # present: no ssh call, no change
+    # ------------------------------------------------------------------ #
+    - name: "CASE present-noop"
+      ansible.builtin.include_role:
+        name: syno_manage_accounts
+      vars:
+        syno_users:
+          - { name: keepme, state: present }
+
+    - name: "ASSERT present -> kept, changed=0, and NO ssh call"
+      vars:
+        _r: "{{ syno_manage_accounts_results | selectattr('name', 'equalto', 'keepme') | first }}"
+      ansible.builtin.assert:
+        that:
+          - _r.action == 'kept'
+          - not (_r.changed | bool)
+          - "'retire keepme' not in lookup('file', _calls_log)"
+        fail_msg: "expected keepme kept + no ssh call, got {{ _r }}"
+        success_msg: "present-noop OK"
+
+    # ------------------------------------------------------------------ #
+    # rc3: wrapper-protected account -> role FAILS loudly (role attempted it)
+    # ------------------------------------------------------------------ #
+    - name: "CASE rc3 wrapper-protected"
+      block:
+        - name: Retire wrapperonly (expects rc3)
+          ansible.builtin.include_role:
+            name: syno_manage_accounts
+          vars:
+            syno_users:
+              - { name: wrapperonly, state: absent }
+        - name: Record rc3 unexpected success
+          ansible.builtin.set_fact:
+            _rc3_failed: false
+      rescue:
+        - name: Record rc3 expected failure
+          ansible.builtin.set_fact:
+            _rc3_failed: true
+            _rc3_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: "ASSERT rc3 -> failed loudly via the explicit mapping, role DID attempt it"
+      ansible.builtin.assert:
+        that:
+          - _rc3_failed | bool
+          - "'exit 3' in _rc3_msg"
+          - "'retire wrapperonly' in lookup('file', _calls_log)"
+        fail_msg: "wrapper-protected retire should FAIL and should have attempted the command"
+        success_msg: "rc3 protected OK"
+
+    # ------------------------------------------------------------------ #
+    # rc2: bad/arbitrary command -> role FAILS loudly
+    # ------------------------------------------------------------------ #
+    - name: "CASE rc2 bad-command"
+      block:
+        - name: Retire badcmd (expects rc2)
+          ansible.builtin.include_role:
+            name: syno_manage_accounts
+          vars:
+            syno_users:
+              - { name: badcmd, state: absent }
+        - name: Record rc2 unexpected success
+          ansible.builtin.set_fact:
+            _rc2_failed: false
+      rescue:
+        - name: Record rc2 expected failure
+          ansible.builtin.set_fact:
+            _rc2_failed: true
+            _rc2_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: "ASSERT rc2 -> failed loudly via the explicit mapping"
+      ansible.builtin.assert:
+        that:
+          - _rc2_failed | bool
+          - "'exit 2' in _rc2_msg"
+        fail_msg: "bad-command (rc2) should FAIL loudly, got msg={{ _rc2_msg | default('') }}"
+        success_msg: "rc2 bad-command OK"
+
+    # ------------------------------------------------------------------ #
+    # in-role denylist (default set): refuse BEFORE any ssh call
+    # ------------------------------------------------------------------ #
+    - name: "CASE denylist-default (root)"
+      block:
+        - name: Retire root (expect in-role refusal before ssh)
+          ansible.builtin.include_role:
+            name: syno_manage_accounts
+          vars:
+            syno_users:
+              - { name: root, state: absent }
+        - name: Record denylist-default unexpected success
+          ansible.builtin.set_fact:
+            _deny_default_failed: false
+      rescue:
+        - name: Record denylist-default expected refusal
+          ansible.builtin.set_fact:
+            _deny_default_failed: true
+            _deny_default_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: "ASSERT denylist-default -> refused via denylist, and NO ssh call was made"
+      ansible.builtin.assert:
+        that:
+          - _deny_default_failed | bool
+          - "'protected denylist' in _deny_default_msg"
+          - "'retire root' not in lookup('file', _calls_log)"
+        fail_msg: "root retire must be refused in-role BEFORE any ssh call"
+        success_msg: "denylist-default OK"
+
+    # ------------------------------------------------------------------ #
+    # in-role denylist is consumer-extensible via syno_protected_users
+    # ------------------------------------------------------------------ #
+    - name: "CASE denylist-extended (specialguard)"
+      block:
+        - name: Retire specialguard with a consumer-supplied denylist
+          ansible.builtin.include_role:
+            name: syno_manage_accounts
+          vars:
+            syno_protected_users:
+              - specialguard
+            syno_users:
+              - { name: specialguard, state: absent }
+        - name: Record denylist-extended unexpected success
+          ansible.builtin.set_fact:
+            _deny_ext_failed: false
+      rescue:
+        - name: Record denylist-extended expected refusal
+          ansible.builtin.set_fact:
+            _deny_ext_failed: true
+            _deny_ext_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: "ASSERT denylist-extended -> refused via denylist, and NO ssh call was made"
+      ansible.builtin.assert:
+        that:
+          - _deny_ext_failed | bool
+          - "'protected denylist' in _deny_ext_msg"
+          - "'retire specialguard' not in lookup('file', _calls_log)"
+        fail_msg: "consumer-supplied denylist entry must be refused before ssh"
+        success_msg: "denylist-extended OK"
+
+    # ------------------------------------------------------------------ #
+    # mixed roster: present kept + absent deleted in one call
+    # ------------------------------------------------------------------ #
+    - name: "CASE mixed-roster"
+      ansible.builtin.include_role:
+        name: syno_manage_accounts
+      vars:
+        syno_users:
+          - { name: keepalice, state: present }
+          - { name: dropbob, state: absent }
+
+    - name: "ASSERT mixed-roster -> alice kept, bob deleted"
+      vars:
+        _alice: "{{ syno_manage_accounts_results | selectattr('name', 'equalto', 'keepalice') | first }}"
+        _bob: "{{ syno_manage_accounts_results | selectattr('name', 'equalto', 'dropbob') | first }}"
+      ansible.builtin.assert:
+        that:
+          - _alice.action == 'kept'
+          - not (_alice.changed | bool)
+          - _bob.action == 'deleted'
+          - _bob.changed | bool
+        fail_msg: "mixed roster mishandled: alice={{ _alice }} bob={{ _bob }}"
+        success_msg: "mixed-roster OK"
+
+    - name: "ALL CASES PASSED"
+      ansible.builtin.debug:
+        msg: "syno_manage_accounts: all mocked-transport cases passed."

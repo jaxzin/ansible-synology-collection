@@ -1,0 +1,38 @@
+---
+# Example / live converge for tafeen.synology.syno_manage_accounts.
+#
+# Unlike test_syno_manage_accounts.yml (which is fully mocked and needs no NAS),
+# this drives a REAL pre-provisioned SSH forced-command transport, so only run it
+# against a NAS whose retire transport already exists.
+#
+# The play runs on localhost and SSHes out to the NAS. The forced-command private
+# key is taken from the environment — never put it in a vars file.
+#
+#   export DSM_SSH_HOST='nas.example.lan'
+#   export DSM_DEPLOY_USER='dsm-retire'
+#   export DSM_RETIRE_SSH_KEY="$(cat /path/to/forced_command_key)"
+#
+#   ansible-playbook --syntax-check converge_accounts.yml
+#   ansible-playbook converge_accounts.yml                     # retire the roster
+#   ansible-playbook converge_accounts.yml                     # idempotency: changed=0
+- name: Manage DSM accounts over the SSH forced-command transport
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    syno_ssh_host: "{{ lookup('env', 'DSM_SSH_HOST') }}"
+    syno_deploy_user: "{{ lookup('env', 'DSM_DEPLOY_USER') | default('dsm-retire', true) }}"
+    syno_ssh_private_key: "{{ lookup('env', 'DSM_RETIRE_SSH_KEY') }}"
+  tasks:
+    - name: Manage accounts
+      ansible.builtin.include_role:
+        name: syno_manage_accounts
+      vars:
+        # Populate with the accounts to manage, e.g.:
+        #   - { name: departed-user, state: absent }
+        #   - { name: keep-me,       state: present }
+        syno_users: []
+
+    - name: Show what the role did
+      ansible.builtin.debug:
+        var: syno_manage_accounts_results

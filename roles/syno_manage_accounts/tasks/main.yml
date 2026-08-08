@@ -1,0 +1,44 @@
+---
+# Manage DSM accounts over a pre-provisioned SSH forced-command transport.
+#
+# Runs from the control node (target localhost / connection: local, like the
+# other roles in this collection) and SSHes out to syno_ssh_host. The key is
+# staged to a private temp file for the run and removed in `always`.
+- name: Manage DSM accounts
+  block:
+    - name: Initialise the per-run results list
+      ansible.builtin.set_fact:
+        # Per-account outcomes: { name, state, action, changed, rc }.
+        # action is one of: deleted | already_absent | kept.
+        syno_manage_accounts_results: []
+
+    - name: Create a private staging directory for the transport key
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: syno-manage-accounts
+      register: _syno_keydir
+      changed_when: false
+      no_log: true
+
+    - name: Stage the forced-command private key (0600)
+      ansible.builtin.copy:
+        content: "{{ syno_ssh_private_key }}"
+        dest: "{{ _syno_keydir.path }}/id_transport"
+        mode: "0600"
+      changed_when: false
+      no_log: true
+
+    - name: Manage each account
+      ansible.builtin.include_tasks: manage_account.yml
+      loop: "{{ syno_users }}"
+      loop_control:
+        loop_var: _user
+        label: "{{ _user.name }} (state={{ _user.state | default('present') }})"
+  always:
+    - name: Remove the staged transport key
+      ansible.builtin.file:
+        path: "{{ _syno_keydir.path }}"
+        state: absent
+      changed_when: false
+      no_log: true
+      when: _syno_keydir.path is defined
